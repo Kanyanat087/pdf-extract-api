@@ -1,4 +1,8 @@
 fastapi
-uvicorn[standard]
+uvicorn
 python-multipart
 PyMuPDF
+python-docx
+python-pptx
+pandas
+openpyxl
