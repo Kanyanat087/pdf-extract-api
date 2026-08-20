@@ -11,14 +11,16 @@ import os
 import hashlib
 
 # ---------------------------------------------------------------
-# ตั้งค่าโฟลเดอร์เก็บรูปและ URL ที่ใช้เข้าถึงรูป
+# ตั้งค่าโฟลเดอร์เก็บรูป
 # ---------------------------------------------------------------
 IMAGE_DIR = "static/extracted_images"
 os.makedirs(IMAGE_DIR, exist_ok=True)
 
-# *** สำคัญ: แก้ตรงนี้ให้เป็น IP จริงของเครื่องที่รัน API ตัวนี้ ***
-# 127.0.0.1 ใช้ได้แค่ในเครื่องตัวเอง เครื่องอื่น (n8n / Teams) จะเปิดรูปไม่ได้
-BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:8000")
+# หมายเหตุ: API คืนค่าเป็น "path" อย่างเดียว ไม่มี domain
+#   เช่น /static/extracted_images/page_1_abc.jpeg
+# เพราะ IP ของเครื่องอาจเปลี่ยนได้ ถ้าเก็บ IP ลงฐานข้อมูลแล้ว IP เปลี่ยน
+# จะต้อง ingest ข้อมูลใหม่ทั้งหมด
+# ให้ n8n เป็นคนเติม domain เองตอนจะใช้งานจริง
 
 # ข้ามรูปที่เล็กกว่านี้ (โลโก้ ไอคอน เส้นคั่น) หน่วยเป็น byte
 MIN_IMAGE_SIZE = 15000
@@ -26,7 +28,7 @@ MIN_IMAGE_SIZE = 15000
 app = FastAPI(
     title="Multi-Format Document Extraction API",
     description="API สำหรับสกัดข้อความและรูปออกจากไฟล์ PDF, DOCX, PPTX, XLSX, TXT เพื่อนำไปใช้ทำ Vector DB / RAG",
-    version="3.0.0"
+    version="3.1.0"
 )
 
 # เปิดให้เข้าถึงรูปผ่าน URL ได้
@@ -45,7 +47,7 @@ def health_check():
 
 def save_page_images(doc, page, page_num):
     """
-    ดึงรูปทั้งหมดในหน้านั้น เซฟลงดิสก์จริง แล้วคืน list ของ URL
+    ดึงรูปทั้งหมดในหน้านั้น เซฟลงดิสก์จริง แล้วคืน list ของ path
     """
     image_list = []
 
@@ -67,11 +69,12 @@ def save_page_images(doc, page, page_num):
         image_filename = f"page_{page_num}_{uuid.uuid4().hex[:8]}.{image_ext}"
         image_path = os.path.join(IMAGE_DIR, image_filename)
 
-        # <<< บรรทัดที่ขาดไปในโค้ดเดิม: เขียนไฟล์ลงดิสก์จริง >>>
+        # เขียนไฟล์ลงดิสก์จริง
         with open(image_path, "wb") as f:
             f.write(image_bytes)
 
-        image_list.append(f"{BASE_URL}/static/extracted_images/{image_filename}")
+        # เก็บเฉพาะ path ไม่มี domain
+        image_list.append(f"/static/extracted_images/{image_filename}")
 
     return image_list
 
