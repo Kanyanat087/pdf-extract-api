@@ -32,7 +32,7 @@ MIN_SECTION_CHARS = 80
 app = FastAPI(
     title="Multi-Format Document Extraction API",
     description="สกัดข้อความและรูปจากเอกสาร แบ่ง chunk ตามหัวข้อ สำหรับ Vector DB / RAG",
-    version="4.0.0",
+    version="4.1.0",
 )
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -106,6 +106,14 @@ def is_heading(line, body_size):
         return True
 
     return False
+
+
+def is_toc_line(text):
+    """
+    บรรทัดสารบัญ เช่น  Trip Activity ..................... 5
+    ตรวจจากจุดไข่ปลาที่ต่อกันยาว ๆ
+    """
+    return bool(re.search(r"\.{6,}", text))
 
 
 # ===============================================================
@@ -192,6 +200,9 @@ def extract_sections(doc):
                 text = "".join(s.get("text", "") for s in line.get("spans", [])).strip()
                 if not text:
                     continue
+                # ข้ามบรรทัดสารบัญ ไม่มีประโยชน์ต่อการค้นหา
+                if is_toc_line(text):
+                    continue
                 y = line.get("bbox", [0, 0, 0, 0])[1]
                 page_lines.append({"text": text, "y": y, "raw": line})
 
@@ -245,8 +256,6 @@ def merge_short_sections(sections):
     buffer = None
 
     for sec in sections:
-        body = "\n".join(sec["lines"]).strip()
-
         if buffer is None:
             buffer = sec
             continue
@@ -343,8 +352,18 @@ async def extract_file(
                     if not part.strip():
                         continue
 
-                    # ใส่บริบทนำหน้าเสมอ เพราะ embedding เห็นแค่ text
-                    header = f"[{system} - {doc_type} - {page_label}]\n[หัวข้อ: {heading}]\n"
+                    # ใส่ path รูปไว้ในตัวข้อความด้วย
+                    # เพราะ AI Agent มองไม่เห็น metadata เห็นแค่ text
+                    # ใส่เฉพาะชิ้นแรก กันรูปซ้ำหลาย chunk
+                    img_line = ""
+                    if sec["images"] and part_index == 0:
+                        img_line = "[รูปประกอบ: " + ", ".join(sec["images"]) + "]\n"
+
+                    header = (
+                        f"[{system} - {doc_type} - {page_label}]\n"
+                        f"[หัวข้อ: {heading}]\n"
+                        f"{img_line}"
+                    )
 
                     results.append({
                         "page": page_start,
@@ -352,7 +371,6 @@ async def extract_file(
                         "heading": heading,
                         "part": part_index + 1,
                         "text": header + part,
-                        # รูปผูกกับ section ใส่เฉพาะชิ้นแรก กันรูปซ้ำหลาย chunk
                         "images": sec["images"] if part_index == 0 else [],
                     })
 
