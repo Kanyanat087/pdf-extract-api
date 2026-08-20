@@ -8,30 +8,33 @@ import gc
 import uuid
 import io
 import os
+import re
 import hashlib
+from collections import Counter
 
 # ---------------------------------------------------------------
-# ตั้งค่าโฟลเดอร์เก็บรูป
+# ตั้งค่า
 # ---------------------------------------------------------------
 IMAGE_DIR = "static/extracted_images"
 os.makedirs(IMAGE_DIR, exist_ok=True)
 
-# หมายเหตุ: API คืนค่าเป็น "path" อย่างเดียว ไม่มี domain
-#   เช่น /static/extracted_images/page_1_abc.jpeg
-# เพราะ IP ของเครื่องอาจเปลี่ยนได้ ถ้าเก็บ IP ลงฐานข้อมูลแล้ว IP เปลี่ยน
-# จะต้อง ingest ข้อมูลใหม่ทั้งหมด
-# ให้ n8n เป็นคนเติม domain เองตอนจะใช้งานจริง
-
 # ข้ามรูปที่เล็กกว่านี้ (โลโก้ ไอคอน เส้นคั่น) หน่วยเป็น byte
 MIN_IMAGE_SIZE = 15000
 
+# หัวข้อ = ฟอนต์ใหญ่กว่าเนื้อความปกติกี่เท่า
+HEADING_SIZE_RATIO = 1.15
+
+# ความยาวสูงสุดต่อ 1 section ถ้าเกินจะถูกซอยย่อย
+MAX_SECTION_CHARS = 1200
+# ถ้า section สั้นกว่านี้ จะถูกรวมกับ section ถัดไป
+MIN_SECTION_CHARS = 80
+
 app = FastAPI(
     title="Multi-Format Document Extraction API",
-    description="API สำหรับสกัดข้อความและรูปออกจากไฟล์ PDF, DOCX, PPTX, XLSX, TXT เพื่อนำไปใช้ทำ Vector DB / RAG",
-    version="3.1.0"
+    description="สกัดข้อความและรูปจากเอกสาร แบ่ง chunk ตามหัวข้อ สำหรับ Vector DB / RAG",
+    version="4.0.0",
 )
 
-# เปิดให้เข้าถึงรูปผ่าน URL ได้
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
@@ -45,11 +48,76 @@ def health_check():
     return {"status": "running"}
 
 
+# ===============================================================
+# ส่วนที่ 1 : หาว่าอะไรคือ "หัวข้อ"
+# ===============================================================
+
+def get_body_font_size(doc):
+    """
+    หาขนาดฟอนต์ของเนื้อความปกติ โดยดูว่าขนาดไหนถูกใช้มากที่สุดทั้งเล่ม
+    ใช้เป็นฐานเทียบว่าอะไรคือหัวข้อ
+    """
+    counter = Counter()
+
+    for page in doc:
+        data = page.get_text("dict")
+        for block in data.get("blocks", []):
+            if block.get("type") != 0:      # 0 = text block
+                continue
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    text = span.get("text", "").strip()
+                    if not text:
+                        continue
+                    size = round(span.get("size", 0), 1)
+                    counter[size] += len(text)   # ถ่วงน้ำหนักด้วยจำนวนตัวอักษร
+
+    if not counter:
+        return 11.0
+    return counter.most_common(1)[0][0]
+
+
+def is_heading(line, body_size):
+    """
+    ตัดสินว่าบรรทัดนี้เป็นหัวข้อหรือไม่
+    เกณฑ์: ฟอนต์ใหญ่กว่าปกติ / ตัวหนา / ขึ้นต้นด้วยเลขข้อ
+    """
+    spans = line.get("spans", [])
+    if not spans:
+        return False
+
+    text = "".join(s.get("text", "") for s in spans).strip()
+    if not text or len(text) > 120:      # หัวข้อมักไม่ยาวมาก
+        return False
+
+    max_size = max(s.get("size", 0) for s in spans)
+    # flags bit 4 (ค่า 16) = ตัวหนา
+    is_bold = any(s.get("flags", 0) & 16 for s in spans)
+
+    if max_size >= body_size * HEADING_SIZE_RATIO:
+        return True
+
+    # ตัวหนา + สั้น = น่าจะเป็นหัวข้อ
+    if is_bold and len(text) < 80:
+        return True
+
+    # รูปแบบเลขข้อ เช่น "1." "1.2" "ขั้นตอนที่ 3"
+    if re.match(r"^(\d+(\.\d+)*[\.\)]?\s+\S|ขั้นตอนที่\s*\d+|บทที่\s*\d+)", text):
+        return True
+
+    return False
+
+
+# ===============================================================
+# ส่วนที่ 2 : เซฟรูป พร้อมจำตำแหน่ง y ไว้
+# ===============================================================
+
 def save_page_images(doc, page, page_num):
     """
-    ดึงรูปทั้งหมดในหน้านั้น เซฟลงดิสก์จริง แล้วคืน list ของ path
+    เซฟรูปในหน้านั้นลงดิสก์ คืน list ของ dict ที่มี path และตำแหน่ง y
+    ตำแหน่ง y ใช้จับคู่รูปกับหัวข้อที่อยู่ใกล้กัน
     """
-    image_list = []
+    saved = []
 
     for img in page.get_images(full=True):
         xref = img[0]
@@ -59,112 +127,313 @@ def save_page_images(doc, page, page_num):
         except Exception:
             continue
 
-        image_bytes = base_image["image"]
-        image_ext = base_image["ext"]
+        image_bytes = base_image.get("image")
+        image_ext = base_image.get("ext", "png")
 
-        # ข้ามรูปเล็ก ๆ ที่ไม่ใช่เนื้อหาจริง
-        if len(image_bytes) < MIN_IMAGE_SIZE:
+        if not image_bytes or len(image_bytes) < MIN_IMAGE_SIZE:
             continue
 
-        image_filename = f"page_{page_num}_{uuid.uuid4().hex[:8]}.{image_ext}"
-        image_path = os.path.join(IMAGE_DIR, image_filename)
+        # หาว่ารูปนี้วางอยู่ตรงไหนในหน้า
+        try:
+            rects = page.get_image_rects(xref)
+            y_top = rects[0].y0 if rects else 0.0
+            y_bottom = rects[0].y1 if rects else 0.0
+        except Exception:
+            y_top, y_bottom = 0.0, 0.0
 
-        # เขียนไฟล์ลงดิสก์จริง
-        with open(image_path, "wb") as f:
+        filename = f"page_{page_num}_{uuid.uuid4().hex[:8]}.{image_ext}"
+        path = os.path.join(IMAGE_DIR, filename)
+
+        with open(path, "wb") as f:
             f.write(image_bytes)
 
-        # เก็บเฉพาะ path ไม่มี domain
-        image_list.append(f"/static/extracted_images/{image_filename}")
+        saved.append({
+            "path": f"/static/extracted_images/{filename}",
+            "y_top": y_top,
+            "y_bottom": y_bottom,
+        })
 
-    return image_list
+    return saved
 
+
+# ===============================================================
+# ส่วนที่ 3 : แบ่งเอกสารเป็น section ตามหัวข้อ
+# ===============================================================
+
+def extract_sections(doc):
+    """
+    เดินทีละหน้า ทีละบรรทัด แล้วรวมเป็น section
+    section ใหม่เริ่มเมื่อเจอหัวข้อ และไหลข้ามหน้าได้
+    """
+    body_size = get_body_font_size(doc)
+    sections = []
+
+    current = {
+        "heading": None,
+        "lines": [],
+        "page_start": 1,
+        "page_end": 1,
+        "images": [],
+    }
+
+    for page_index, page in enumerate(doc):
+        page_num = page_index + 1
+        page_images = save_page_images(doc, page, page_num)
+        used_images = set()
+
+        data = page.get_text("dict")
+
+        # รวบรวมทุกบรรทัดในหน้า พร้อมตำแหน่ง y แล้วเรียงจากบนลงล่าง
+        page_lines = []
+        for block in data.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                text = "".join(s.get("text", "") for s in line.get("spans", [])).strip()
+                if not text:
+                    continue
+                y = line.get("bbox", [0, 0, 0, 0])[1]
+                page_lines.append({"text": text, "y": y, "raw": line})
+
+        page_lines.sort(key=lambda x: x["y"])
+
+        for idx, item in enumerate(page_lines):
+            if is_heading(item["raw"], body_size):
+                # ปิด section เดิมก่อนเริ่มอันใหม่
+                if current["lines"] or current["heading"]:
+                    sections.append(current)
+
+                current = {
+                    "heading": item["text"],
+                    "lines": [],
+                    "page_start": page_num,
+                    "page_end": page_num,
+                    "images": [],
+                }
+            else:
+                current["lines"].append(item["text"])
+                current["page_end"] = page_num
+
+            # ผูกรูปที่อยู่ระหว่างบรรทัดนี้กับบรรทัดถัดไป เข้ากับ section ปัจจุบัน
+            y_now = item["y"]
+            y_next = page_lines[idx + 1]["y"] if idx + 1 < len(page_lines) else 10_000
+
+            for img_i, img in enumerate(page_images):
+                if img_i in used_images:
+                    continue
+                if y_now <= img["y_top"] < y_next:
+                    current["images"].append(img["path"])
+                    used_images.add(img_i)
+
+        # รูปที่ยังจับคู่ไม่ได้ (เช่นอยู่บนสุดของหน้า) ให้ผูกกับ section ปัจจุบัน
+        for img_i, img in enumerate(page_images):
+            if img_i not in used_images:
+                current["images"].append(img["path"])
+
+    if current["lines"] or current["heading"]:
+        sections.append(current)
+
+    return sections
+
+
+def merge_short_sections(sections):
+    """
+    section ที่สั้นเกินไป (เช่นหัวข้อลอย ๆ ไม่มีเนื้อหา) ให้รวมกับอันถัดไป
+    ป้องกัน chunk เศษ ๆ ที่ไม่มีความหมาย
+    """
+    merged = []
+    buffer = None
+
+    for sec in sections:
+        body = "\n".join(sec["lines"]).strip()
+
+        if buffer is None:
+            buffer = sec
+            continue
+
+        buffer_body = "\n".join(buffer["lines"]).strip()
+
+        if len(buffer_body) < MIN_SECTION_CHARS:
+            # ยุบ buffer เข้ากับ section ปัจจุบัน
+            head = buffer["heading"]
+            if head:
+                sec["lines"] = [head] + buffer["lines"] + sec["lines"]
+            else:
+                sec["lines"] = buffer["lines"] + sec["lines"]
+            sec["images"] = buffer["images"] + sec["images"]
+            sec["page_start"] = buffer["page_start"]
+            buffer = sec
+        else:
+            merged.append(buffer)
+            buffer = sec
+
+    if buffer is not None:
+        merged.append(buffer)
+
+    return merged
+
+
+def split_long_section(section):
+    """
+    section ที่ยาวเกินไป ให้ซอยเป็นชิ้นย่อย
+    แต่ยังคงใส่หัวข้อเดิมนำหน้าทุกชิ้น เพื่อไม่ให้หลุดบริบท
+    """
+    body = "\n".join(section["lines"]).strip()
+
+    if len(body) <= MAX_SECTION_CHARS:
+        return [body]
+
+    parts = []
+    buf = ""
+
+    for line in section["lines"]:
+        if len(buf) + len(line) + 1 > MAX_SECTION_CHARS and buf:
+            parts.append(buf.strip())
+            buf = line
+        else:
+            buf = f"{buf}\n{line}" if buf else line
+
+    if buf.strip():
+        parts.append(buf.strip())
+
+    return parts
+
+
+# ===============================================================
+# ส่วนที่ 4 : endpoint
+# ===============================================================
 
 @app.post("/extract")
 async def extract_file(
     file: UploadFile,
-    system: str = Form("unknown"),      # เช่น ACCA, e-Payment
-    doc_type: str = Form("manual"),     # manual หรือ faq
+    system: str = Form(""),
+    doc_type: str = Form(""),
 ):
     try:
         content = await file.read()
         file_hash = hashlib.sha256(content).hexdigest()
         results = []
-        filename = file.filename.lower()
+        filename = file.filename
+        lower_name = filename.lower()
 
-        # 1. PDF (ดึงข้อความ + สกัดรูป)
-        if filename.endswith(".pdf"):
+        # ถ้าไม่ได้ส่งมา ให้เดาจากชื่อไฟล์ เช่น ACCA_manual.pdf
+        if not system:
+            system = filename.split("_")[0] if "_" in filename else "unknown"
+        if not doc_type:
+            doc_type = "faq" if "faq" in lower_name else "manual"
+
+        # -------------------- PDF --------------------
+        if lower_name.endswith(".pdf"):
             doc = fitz.open(stream=content, filetype="pdf")
 
-            for page_index, page in enumerate(doc):
-                page_num = page_index + 1
-                raw_text = page.get_text()
+            sections = extract_sections(doc)
+            sections = merge_short_sections(sections)
 
-                # ใส่หัวเรื่องนำหน้าเนื้อหา เพื่อให้ embedding มีบริบท
-                # (embedding มองเห็นแค่ text ไม่เห็น metadata)
-                text = f"[{system} - {doc_type} - หน้า {page_num}]\n{raw_text}"
+            for sec in sections:
+                heading = sec["heading"] or "(ไม่มีหัวข้อ)"
+                page_start = sec["page_start"]
+                page_end = sec["page_end"]
+                page_label = (
+                    f"หน้า {page_start}"
+                    if page_start == page_end
+                    else f"หน้า {page_start}-{page_end}"
+                )
 
-                image_list = save_page_images(doc, page, page_num)
+                for part_index, part in enumerate(split_long_section(sec)):
+                    if not part.strip():
+                        continue
 
-                results.append({
-                    "page": page_num,
-                    "text": text,
-                    "images": image_list,
-                })
+                    # ใส่บริบทนำหน้าเสมอ เพราะ embedding เห็นแค่ text
+                    header = f"[{system} - {doc_type} - {page_label}]\n[หัวข้อ: {heading}]\n"
+
+                    results.append({
+                        "page": page_start,
+                        "page_end": page_end,
+                        "heading": heading,
+                        "part": part_index + 1,
+                        "text": header + part,
+                        # รูปผูกกับ section ใส่เฉพาะชิ้นแรก กันรูปซ้ำหลาย chunk
+                        "images": sec["images"] if part_index == 0 else [],
+                    })
 
             doc.close()
 
-        # 2. ไฟล์ข้อความ (.txt, .md, .json, .log, .csv)
-        elif filename.endswith((".txt", ".md", ".json", ".log", ".csv")):
+        # -------------------- ไฟล์ข้อความ --------------------
+        elif lower_name.endswith((".txt", ".md", ".json", ".log", ".csv")):
             raw_text = content.decode("utf-8", errors="ignore")
             results.append({
                 "page": 1,
+                "heading": filename,
                 "text": f"[{system} - {doc_type}]\n{raw_text}",
                 "images": [],
             })
 
-        # 3. Word (.docx)
-        elif filename.endswith(".docx"):
-            doc = docx.Document(io.BytesIO(content))
-            full_text = [p.text for p in doc.paragraphs if p.text.strip()]
-            results.append({
-                "page": 1,
-                "text": f"[{system} - {doc_type}]\n" + "\n".join(full_text),
-                "images": [],
-            })
+        # -------------------- Word --------------------
+        elif lower_name.endswith(".docx"):
+            d = docx.Document(io.BytesIO(content))
 
-        # 4. PowerPoint (.pptx)
-        elif filename.endswith(".pptx"):
+            current_heading = "(ไม่มีหัวข้อ)"
+            buf = []
+
+            def flush():
+                if buf:
+                    results.append({
+                        "page": 1,
+                        "heading": current_heading,
+                        "text": f"[{system} - {doc_type}]\n[หัวข้อ: {current_heading}]\n"
+                                + "\n".join(buf),
+                        "images": [],
+                    })
+
+            for p in d.paragraphs:
+                text = p.text.strip()
+                if not text:
+                    continue
+
+                # ใช้ style ของ Word บอกว่าเป็นหัวข้อ
+                if p.style.name.startswith("Heading") or p.style.name == "Title":
+                    flush()
+                    buf = []
+                    current_heading = text
+                else:
+                    buf.append(text)
+
+            flush()
+
+        # -------------------- PowerPoint --------------------
+        elif lower_name.endswith(".pptx"):
             prs = Presentation(io.BytesIO(content))
             for idx, slide in enumerate(prs.slides):
                 slide_text = [
                     shape.text for shape in slide.shapes
                     if hasattr(shape, "text") and shape.text
                 ]
+                title = slide_text[0] if slide_text else f"สไลด์ {idx + 1}"
                 results.append({
                     "page": idx + 1,
-                    "text": f"[{system} - {doc_type} - สไลด์ {idx + 1}]\n" + "\n".join(slide_text),
+                    "heading": title,
+                    "text": f"[{system} - {doc_type} - สไลด์ {idx + 1}]\n[หัวข้อ: {title}]\n"
+                            + "\n".join(slide_text),
                     "images": [],
                 })
 
-        # 5. Excel (.xlsx, .xls)
-        elif filename.endswith((".xlsx", ".xls")):
+        # -------------------- Excel --------------------
+        elif lower_name.endswith((".xlsx", ".xls")):
             excel_file = pd.ExcelFile(io.BytesIO(content))
             for sheet_name in excel_file.sheet_names:
                 df = pd.read_excel(excel_file, sheet_name=sheet_name)
-                text = (
-                    f"[{system} - {doc_type} - Sheet: {sheet_name}]\n"
-                    + df.to_csv(index=False)
-                )
                 results.append({
                     "page": sheet_name,
-                    "text": text,
+                    "heading": sheet_name,
+                    "text": f"[{system} - {doc_type} - Sheet: {sheet_name}]\n"
+                            + df.to_csv(index=False),
                     "images": [],
                 })
 
         else:
             raise HTTPException(
                 status_code=400,
-                detail=f"ไม่รองรับไฟล์ประเภทนี้: {file.filename}"
+                detail=f"ไม่รองรับไฟล์ประเภทนี้: {filename}",
             )
 
         del content
@@ -172,8 +441,8 @@ async def extract_file(
 
         return {
             "status": "ok",
-            "filename": file.filename,
-            "file_hash": file_hash,     # ใช้เช็กไฟล์ซ้ำได้
+            "filename": filename,
+            "file_hash": file_hash,
             "system": system,
             "doc_type": doc_type,
             "total_pages": len(results),
@@ -186,5 +455,5 @@ async def extract_file(
         gc.collect()
         raise HTTPException(
             status_code=500,
-            detail=f"เกิดข้อผิดพลาดในการประมวลผลไฟล์: {str(e)}"
+            detail=f"เกิดข้อผิดพลาดในการประมวลผลไฟล์: {str(e)}",
         )
