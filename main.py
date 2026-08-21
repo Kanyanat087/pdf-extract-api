@@ -40,7 +40,7 @@ SELF_CONTAINED_MARKERS = ["Resolution Steps"]
 app = FastAPI(
     title="Multi-Format Document Extraction API",
     description="สกัดข้อความและรูปจากเอกสาร แบ่ง chunk ตามหัวข้อ สำหรับ Vector DB / RAG",
-    version="4.2.0",
+    version="4.3.0",
 )
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -114,10 +114,16 @@ def is_heading(line, body_size):
     ตัดสินว่าบรรทัดนี้เป็นหัวข้อหรือไม่
     เกณฑ์: ฟอนต์ใหญ่กว่าปกติ หรือ ตัวหนา + สั้น
 
-    [แก้บั๊ก] เอากฎ "ขึ้นต้นด้วยเลขข้อ" ออก
+    [แก้บั๊ก 4.2] เอากฎ "ขึ้นต้นด้วยเลขข้อ" ออก
     กฎเดิมทำให้ขั้นตอน 1. 2. 3. 4. ในเนื้อหา ถูกมองเป็นหัวข้อใหม่ทุกข้อ
     ผลคือขั้นตอนแก้ปัญหาชุดเดียวถูกหั่นเป็น chunk ละข้อ
     คำถามอยู่ chunk หนึ่ง คำตอบอยู่อีก chunk หนึ่ง
+
+    [แก้บั๊ก 4.3] กรองเลขลอย ๆ และเลขโรมันออก
+    พบใน EPayment.pdf ว่า 153 จาก 195 chunk (78%) มี heading เป็น
+    ตัวเลขล้วนหรือเลขโรมันล้วน เช่น "3" "2" "II." "III."
+    เพราะเลขข้อหรือเลขหน้าที่พิมพ์ตัวหนา เข้าเงื่อนไข is_bold + สั้น
+    ทำให้ chunk ถูกหั่นทุกครั้งที่เจอเลข และ heading ไม่ให้บริบทกับ LLM เลย
     """
     spans = line.get("spans", [])
     if not spans:
@@ -126,6 +132,24 @@ def is_heading(line, body_size):
     text = "".join(s.get("text", "") for s in spans).strip()
     if not text or len(text) > 120:      # หัวข้อมักไม่ยาวมาก
         return False
+
+    # --- กรองสิ่งที่ไม่มีทางเป็นหัวข้อ ---
+
+    # ต้องมีตัวอักษรอย่างน้อย 1 ตัว (ไทยหรืออังกฤษ)
+    # กรอง "3" "2." "1)" "-" "•" ที่เป็นเลขข้อหรือ bullet
+    if not re.search(r"[A-Za-zก-๙]", text):
+        return False
+
+    # เลขโรมันล้วน เช่น "II." "III." "IV)" "i."
+    # มีตัวอักษรจึงรอดกฎข้างบนมาได้ แต่ไม่ใช่หัวข้อ
+    if re.fullmatch(r"[IVXLCDMivxlcdm]+[\.\)]?", text):
+        return False
+
+    # สั้นเกินกว่าจะเป็นหัวข้อที่มีความหมาย
+    if len(text) < 3:
+        return False
+
+    # --- เกณฑ์ตัดสินว่าเป็นหัวข้อ ---
 
     max_size = max(s.get("size", 0) for s in spans)
     # flags bit 4 (ค่า 16) = ตัวหนา
