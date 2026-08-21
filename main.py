@@ -26,13 +26,21 @@ HEADING_SIZE_RATIO = 1.15
 
 # ความยาวสูงสุดต่อ 1 section ถ้าเกินจะถูกซอยย่อย
 MAX_SECTION_CHARS = 1200
+
 # ถ้า section สั้นกว่านี้ จะถูกรวมกับ section ถัดไป
+# หมายเหตุ: อย่าตั้งสูงเกินไป เพราะเคสที่เนื้อหาสั้นแต่จบในตัวเอง
+# จะถูกลากไปรวมกับเคสถัดไป กลายเป็น chunk ที่ปนสองเรื่อง
 MIN_SECTION_CHARS = 80
+
+# ถ้า section มีคำเหล่านี้อยู่แล้ว ถือว่า "จบในตัวเอง" ห้ามลากไปรวมกับอันถัดไป
+# แม้เนื้อหาจะสั้นกว่า MIN_SECTION_CHARS ก็ตาม
+# (ปรับตามรูปแบบคู่มือของแต่ละองค์กร ถ้าไม่ต้องการให้ตั้งเป็น [] )
+SELF_CONTAINED_MARKERS = ["Resolution Steps"]
 
 app = FastAPI(
     title="Multi-Format Document Extraction API",
     description="สกัดข้อความและรูปจากเอกสาร แบ่ง chunk ตามหัวข้อ สำหรับ Vector DB / RAG",
-    version="4.1.0",
+    version="4.2.0",
 )
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -46,6 +54,30 @@ def root():
 @app.get("/health")
 def health_check():
     return {"status": "running"}
+
+
+# ===============================================================
+# ส่วนที่ 0 : ชื่อระบบจากชื่อไฟล์
+# ===============================================================
+
+def guess_system_name(filename):
+    """
+    เดาชื่อระบบจากชื่อไฟล์
+
+    [แก้บั๊ก] ของเดิม: filename.split("_")[0] if "_" in filename else "unknown"
+    ทำให้ไฟล์ที่ไม่มีขีดล่างกลายเป็น unknown ทั้งหมด
+      ACCA_manual_pdf.pdf  ->  ACCA        (บังเอิญถูก)
+      EPayment.pdf         ->  unknown     (ผิด)
+
+    ของใหม่: ตัดนามสกุลออกก่อน แล้วเอาส่วนหน้าขีดล่างถ้ามี
+             ถ้าไม่มีขีดล่างก็ใช้ชื่อไฟล์ทั้งอัน ไม่ตกไปเป็น unknown อีก
+      ACCA_manual_pdf.pdf  ->  ACCA
+      EPayment.pdf         ->  EPayment
+    """
+    stem = os.path.splitext(filename)[0].strip()
+    if not stem:
+        return "unknown"
+    return stem.split("_")[0] if "_" in stem else stem
 
 
 # ===============================================================
@@ -80,7 +112,12 @@ def get_body_font_size(doc):
 def is_heading(line, body_size):
     """
     ตัดสินว่าบรรทัดนี้เป็นหัวข้อหรือไม่
-    เกณฑ์: ฟอนต์ใหญ่กว่าปกติ / ตัวหนา / ขึ้นต้นด้วยเลขข้อ
+    เกณฑ์: ฟอนต์ใหญ่กว่าปกติ หรือ ตัวหนา + สั้น
+
+    [แก้บั๊ก] เอากฎ "ขึ้นต้นด้วยเลขข้อ" ออก
+    กฎเดิมทำให้ขั้นตอน 1. 2. 3. 4. ในเนื้อหา ถูกมองเป็นหัวข้อใหม่ทุกข้อ
+    ผลคือขั้นตอนแก้ปัญหาชุดเดียวถูกหั่นเป็น chunk ละข้อ
+    คำถามอยู่ chunk หนึ่ง คำตอบอยู่อีก chunk หนึ่ง
     """
     spans = line.get("spans", [])
     if not spans:
@@ -99,10 +136,6 @@ def is_heading(line, body_size):
 
     # ตัวหนา + สั้น = น่าจะเป็นหัวข้อ
     if is_bold and len(text) < 80:
-        return True
-
-    # รูปแบบเลขข้อ เช่น "1." "1.2" "ขั้นตอนที่ 3"
-    if re.match(r"^(\d+(\.\d+)*[\.\)]?\s+\S|ขั้นตอนที่\s*\d+|บทที่\s*\d+)", text):
         return True
 
     return False
@@ -172,6 +205,9 @@ def extract_sections(doc):
     """
     เดินทีละหน้า ทีละบรรทัด แล้วรวมเป็น section
     section ใหม่เริ่มเมื่อเจอหัวข้อ และไหลข้ามหน้าได้
+
+    หมายเหตุ: page_lines.sort(key=lambda x: x["y"]) ถูกต้องแล้ว
+    PyMuPDF นับ y จากบนลงล่าง เรียงน้อยไปมาก = บนลงล่าง ห้ามกลับทิศ
     """
     body_size = get_body_font_size(doc)
     sections = []
@@ -247,10 +283,33 @@ def extract_sections(doc):
     return sections
 
 
+def _is_self_contained(section):
+    """
+    section นี้จบในตัวเองหรือยัง ถ้าใช่จะไม่ถูกลากไปรวมกับอันถัดไป
+    กันเคสที่เนื้อหาสั้นแต่ครบชุด ถูกรวมกับเรื่องอื่นจนปนกัน
+    """
+    if not SELF_CONTAINED_MARKERS:
+        return False
+    body = "\n".join(section["lines"])
+    return any(marker in body for marker in SELF_CONTAINED_MARKERS)
+
+
 def merge_short_sections(sections):
     """
     section ที่สั้นเกินไป (เช่นหัวข้อลอย ๆ ไม่มีเนื้อหา) ให้รวมกับอันถัดไป
-    ป้องกัน chunk เศษ ๆ ที่ไม่มีความหมาย
+
+    [แก้บั๊กใหญ่] ของเดิมเขียนว่า
+        sec["lines"] = [head] + buffer["lines"] + sec["lines"]
+    คือเอา section ปัจจุบันไปแปะ "หน้า" section ถัดไป
+    พอ section สั้นต่อกันหลายอัน เนื้อหาจะเรียงถอยหลังสะสม
+    และ heading ที่เหลือกลายเป็นอันล่างสุดของหน้า
+
+    ตัวอย่างหน้าปก ACCA ที่เคยได้ออกมา (กลับหัวทั้งหมด)
+        heading: Vaneenut Singkanthana
+        lines:   Create By / Version Common Issues /
+                 Advance Claim Application (ACCA) / User Manual Document
+
+    ของใหม่: ต่อท้ายตามลำดับจริง และเก็บ heading "แรก" ไว้เป็นชื่อ section
     """
     merged = []
     buffer = None
@@ -261,17 +320,26 @@ def merge_short_sections(sections):
             continue
 
         buffer_body = "\n".join(buffer["lines"]).strip()
+        too_short = len(buffer_body) < MIN_SECTION_CHARS
 
-        if len(buffer_body) < MIN_SECTION_CHARS:
-            # ยุบ buffer เข้ากับ section ปัจจุบัน
-            head = buffer["heading"]
-            if head:
-                sec["lines"] = [head] + buffer["lines"] + sec["lines"]
-            else:
-                sec["lines"] = buffer["lines"] + sec["lines"]
-            sec["images"] = buffer["images"] + sec["images"]
-            sec["page_start"] = buffer["page_start"]
-            buffer = sec
+        if too_short and not _is_self_contained(buffer):
+            lines = list(buffer["lines"])
+
+            # หัวข้อของ section ถัดไป กลายเป็นบรรทัดเนื้อหาต่อท้าย
+            # (ไม่ใช่แปะไว้ข้างหน้าเหมือนโค้ดเดิม)
+            if sec["heading"]:
+                lines.append(sec["heading"])
+
+            lines.extend(sec["lines"])
+
+            buffer = {
+                # เก็บหัวข้อแรกไว้ ถ้าอันแรกไม่มีค่อยใช้ของอันถัดไป
+                "heading": buffer["heading"] or sec["heading"],
+                "lines": lines,
+                "page_start": buffer["page_start"],
+                "page_end": sec["page_end"],
+                "images": buffer["images"] + sec["images"],
+            }
         else:
             merged.append(buffer)
             buffer = sec
@@ -286,6 +354,7 @@ def split_long_section(section):
     """
     section ที่ยาวเกินไป ให้ซอยเป็นชิ้นย่อย
     แต่ยังคงใส่หัวข้อเดิมนำหน้าทุกชิ้น เพื่อไม่ให้หลุดบริบท
+    (การใส่หัวข้อนำหน้าทำใน endpoint ตอนประกอบ header)
     """
     body = "\n".join(section["lines"]).strip()
 
@@ -325,9 +394,9 @@ async def extract_file(
         filename = file.filename
         lower_name = filename.lower()
 
-        # ถ้าไม่ได้ส่งมา ให้เดาจากชื่อไฟล์ เช่น ACCA_manual.pdf
+        # ถ้าไม่ได้ส่งมา ให้เดาจากชื่อไฟล์
         if not system:
-            system = filename.split("_")[0] if "_" in filename else "unknown"
+            system = guess_system_name(filename)
         if not doc_type:
             doc_type = "faq" if "faq" in lower_name else "manual"
 
