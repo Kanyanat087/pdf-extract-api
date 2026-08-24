@@ -8,6 +8,7 @@ import gc
 import uuid
 import io
 import os
+import base64
 import re
 import hashlib
 from collections import Counter
@@ -17,6 +18,9 @@ from collections import Counter
 # ---------------------------------------------------------------
 IMAGE_DIR = "static/extracted_images"
 os.makedirs(IMAGE_DIR, exist_ok=True)
+
+# หมายเหตุ 5.0: ไม่เขียนไฟล์รูปลงดิสก์อีกแล้ว รูปถูกส่งกลับเป็น base64
+# ให้ n8n เขียนลง C:\\n8n\\images\\ เอง ดู save_page_images()
 
 # ข้ามรูปที่เล็กกว่านี้ (โลโก้ ไอคอน เส้นคั่น) หน่วยเป็น byte
 MIN_IMAGE_SIZE = 15000
@@ -40,7 +44,7 @@ SELF_CONTAINED_MARKERS = ["Resolution Steps"]
 app = FastAPI(
     title="Multi-Format Document Extraction API",
     description="สกัดข้อความและรูปจากเอกสาร แบ่ง chunk ตามหัวข้อ สำหรับ Vector DB / RAG",
-    version="4.3.0",
+    version="5.0.0",
 )
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -179,8 +183,16 @@ def is_toc_line(text):
 
 def save_page_images(doc, page, page_num):
     """
-    เซฟรูปในหน้านั้นลงดิสก์ คืน list ของ dict ที่มี path และตำแหน่ง y
+    สกัดรูปในหน้านั้น คืน list ของ dict ที่มี filename, base64 และตำแหน่ง y
     ตำแหน่ง y ใช้จับคู่รูปกับหัวข้อที่อยู่ใกล้กัน
+
+    [เปลี่ยนใน 5.0] ไม่เขียนไฟล์ลงดิสก์อีกแล้ว
+    เดิมเขียนลง static/extracted_images บน Render ซึ่งเป็น ephemeral filesystem
+    ไฟล์หายทุกครั้งที่ sleep / deploy / ย้าย container
+    ทำให้ลิงก์ "ดูภาพประกอบ" ที่ผู้ใช้กดขึ้น 404 (ปัญหาข้อ 2.1)
+
+    ของใหม่: คืนรูปเป็น base64 ให้ n8n เอาไปเขียนลง C:\\n8n\\images\\ เอง
+    ซึ่งเป็นดิสก์จริงบนเซิร์ฟเวอร์บริษัท ไฟล์ไม่หาย
     """
     saved = []
 
@@ -207,13 +219,12 @@ def save_page_images(doc, page, page_num):
             y_top, y_bottom = 0.0, 0.0
 
         filename = f"page_{page_num}_{uuid.uuid4().hex[:8]}.{image_ext}"
-        path = os.path.join(IMAGE_DIR, filename)
-
-        with open(path, "wb") as f:
-            f.write(image_bytes)
 
         saved.append({
-            "path": f"/static/extracted_images/{filename}",
+            "filename": filename,
+            "base64": base64.b64encode(image_bytes).decode("ascii"),
+            "mime": f"image/{'jpeg' if image_ext in ('jpg', 'jpeg') else image_ext}",
+            "size": len(image_bytes),
             "y_top": y_top,
             "y_bottom": y_bottom,
         })
@@ -235,6 +246,7 @@ def extract_sections(doc):
     """
     body_size = get_body_font_size(doc)
     sections = []
+    all_images = []          # เก็บ base64 ของรูปทุกใบ ส่งกลับให้ n8n เขียนลงดิสก์
 
     current = {
         "heading": None,
@@ -293,18 +305,28 @@ def extract_sections(doc):
                 if img_i in used_images:
                     continue
                 if y_now <= img["y_top"] < y_next:
-                    current["images"].append(img["path"])
+                    current["images"].append(img["filename"])
                     used_images.add(img_i)
 
         # รูปที่ยังจับคู่ไม่ได้ (เช่นอยู่บนสุดของหน้า) ให้ผูกกับ section ปัจจุบัน
         for img_i, img in enumerate(page_images):
             if img_i not in used_images:
-                current["images"].append(img["path"])
+                current["images"].append(img["filename"])
+
+        # เก็บข้อมูลรูปทั้งหมดไว้ที่เดียว เพื่อส่งกลับให้ n8n เขียนลงดิสก์
+        for img in page_images:
+            all_images.append({
+                "filename": img["filename"],
+                "base64": img["base64"],
+                "mime": img["mime"],
+                "size": img["size"],
+                "page": page_num,
+            })
 
     if current["lines"] or current["heading"]:
         sections.append(current)
 
-    return sections
+    return sections, all_images
 
 
 def _is_self_contained(section):
@@ -415,6 +437,7 @@ async def extract_file(
         content = await file.read()
         file_hash = hashlib.sha256(content).hexdigest()
         results = []
+        extracted_images = []
         filename = file.filename
         lower_name = filename.lower()
 
@@ -428,7 +451,7 @@ async def extract_file(
         if lower_name.endswith(".pdf"):
             doc = fitz.open(stream=content, filetype="pdf")
 
-            sections = extract_sections(doc)
+            sections, extracted_images = extract_sections(doc)
             sections = merge_short_sections(sections)
 
             for sec in sections:
@@ -558,6 +581,10 @@ async def extract_file(
             "doc_type": doc_type,
             "total_pages": len(results),
             "pages": results,
+            # รูปทั้งหมดเป็น base64 ให้ n8n เขียนลง C:\n8n\images\ เอง
+            # ชื่อไฟล์ตรงกับที่ปรากฏใน [รูปประกอบ: ...] ของแต่ละ chunk
+            "images": extracted_images,
+            "image_count": len(extracted_images),
         }
 
     except HTTPException as he:
