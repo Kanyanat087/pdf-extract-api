@@ -5,7 +5,6 @@ import docx  # python-docx
 from pptx import Presentation  # python-pptx
 import pandas as pd  # pandas
 import gc
-import uuid
 import io
 import os
 import base64
@@ -44,7 +43,7 @@ SELF_CONTAINED_MARKERS = ["Resolution Steps"]
 app = FastAPI(
     title="Multi-Format Document Extraction API",
     description="สกัดข้อความและรูปจากเอกสาร แบ่ง chunk ตามหัวข้อ สำหรับ Vector DB / RAG",
-    version="5.0.0",
+    version="5.1.0",
 )
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -193,6 +192,15 @@ def save_page_images(doc, page, page_num):
 
     ของใหม่: คืนรูปเป็น base64 ให้ n8n เอาไปเขียนลง C:\\n8n\\images\\ เอง
     ซึ่งเป็นดิสก์จริงบนเซิร์ฟเวอร์บริษัท ไฟล์ไม่หาย
+
+    [แก้บั๊ก 5.1] เปลี่ยนชื่อไฟล์จาก uuid สุ่ม เป็น hash ของเนื้อรูป
+    ของเดิม: f"page_{page_num}_{uuid.uuid4().hex[:8]}.{ext}"
+    uuid4() สุ่มใหม่ทุกครั้ง ทำให้ ingest ซ้ำได้ชื่อไฟล์ใหม่หมด
+    ผลคือชื่อที่เก็บใน vector metadata (รอบเก่า) ไม่ตรงกับไฟล์บนดิสก์ (รอบใหม่)
+    n8n อ่านไฟล์ไม่เจอ ขึ้น "No file(s) found"
+
+    ของใหม่: ใช้ sha256 ของ image_bytes รูปเดิมได้ชื่อเดิมเสมอ
+    ingest ซ้ำกี่รอบก็ตรงกัน และรูปซ้ำข้ามหน้าก็ยังแยกกันด้วย page_num
     """
     saved = []
 
@@ -218,7 +226,9 @@ def save_page_images(doc, page, page_num):
         except Exception:
             y_top, y_bottom = 0.0, 0.0
 
-        filename = f"page_{page_num}_{uuid.uuid4().hex[:8]}.{image_ext}"
+        # ชื่อไฟล์ต้องคงที่ ห้ามสุ่ม ไม่งั้น metadata กับดิสก์จะไม่ตรงกัน
+        img_hash = hashlib.sha256(image_bytes).hexdigest()[:8]
+        filename = f"page_{page_num}_{img_hash}.{image_ext}"
 
         saved.append({
             "filename": filename,
