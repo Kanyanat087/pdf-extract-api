@@ -43,7 +43,7 @@ SELF_CONTAINED_MARKERS = ["Resolution Steps"]
 app = FastAPI(
     title="Multi-Format Document Extraction API",
     description="สกัดข้อความและรูปจากเอกสาร แบ่ง chunk ตามหัวข้อ สำหรับ Vector DB / RAG",
-    version="5.1.0",
+    version="5.2.0",
 )
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -60,7 +60,7 @@ def health_check():
 
 
 # ===============================================================
-# ส่วนที่ 0 : ชื่อระบบจากชื่อไฟล์
+# ส่วนที่ 0 : ชื่อระบบจากชื่อไฟล์ และภาษาของเนื้อหา
 # ===============================================================
 
 def guess_system_name(filename):
@@ -81,6 +81,23 @@ def guess_system_name(filename):
     if not stem:
         return "unknown"
     return stem.split("_")[0] if "_" in stem else stem
+
+
+def detect_lang(text):
+    """
+    [เพิ่มใน 5.2] ตรวจภาษาของ chunk เพื่อติดป้าย lang ลง vector metadata
+
+    ใช้แยก tool ค้นหาใน n8n เป็นสองตัว (lang=th / lang=en) โดยให้แต่ละตัว
+    มีโควตาผลลัพธ์ของตัวเอง ป้องกันไม่ให้ chunk ภาษาเดียวกับคำถาม
+    กวาดที่นั่งไปหมดจน chunk อีกภาษาที่ตอบตรงกว่าไม่ถูกดึงมาเลย
+
+    กฎ: เจออักขระไทยแม้ตัวเดียว = th, เป็นอังกฤษล้วน = en
+
+    ⚠️ สำคัญ: ต้องเรียกด้วย "เนื้อหาล้วน" เท่านั้น ห้ามส่งข้อความที่เติม
+    header แล้วเข้ามา เพราะ header ทุกอันมีคำว่า "หน้า" และ "หัวข้อ"
+    ซึ่งเป็นภาษาไทย จะทำให้ทุก chunk ถูกตัดสินเป็น th หมดทั้งฐาน
+    """
+    return "th" if re.search(r"[ก-๙]", text or "") else "en"
 
 
 # ===============================================================
@@ -497,6 +514,9 @@ async def extract_file(
                         "heading": heading,
                         "part": part_index + 1,
                         "text": header + part,
+                        # ตรวจจาก heading + เนื้อหาเท่านั้น ไม่รวม header
+                        # เพราะ header มีคำว่า หน้า/หัวข้อ เป็นไทยทุกอัน
+                        "lang": detect_lang(f"{heading}\n{part}"),
                         "images": sec["images"] if part_index == 0 else [],
                     })
 
@@ -509,6 +529,7 @@ async def extract_file(
                 "page": 1,
                 "heading": filename,
                 "text": f"[{system} - {doc_type}]\n{raw_text}",
+                "lang": detect_lang(raw_text),
                 "images": [],
             })
 
@@ -521,11 +542,13 @@ async def extract_file(
 
             def flush():
                 if buf:
+                    body = "\n".join(buf)
                     results.append({
                         "page": 1,
                         "heading": current_heading,
                         "text": f"[{system} - {doc_type}]\n[หัวข้อ: {current_heading}]\n"
-                                + "\n".join(buf),
+                                + body,
+                        "lang": detect_lang(f"{current_heading}\n{body}"),
                         "images": [],
                     })
 
@@ -553,11 +576,13 @@ async def extract_file(
                     if hasattr(shape, "text") and shape.text
                 ]
                 title = slide_text[0] if slide_text else f"สไลด์ {idx + 1}"
+                body = "\n".join(slide_text)
                 results.append({
                     "page": idx + 1,
                     "heading": title,
                     "text": f"[{system} - {doc_type} - สไลด์ {idx + 1}]\n[หัวข้อ: {title}]\n"
-                            + "\n".join(slide_text),
+                            + body,
+                    "lang": detect_lang(body),
                     "images": [],
                 })
 
@@ -566,11 +591,15 @@ async def extract_file(
             excel_file = pd.ExcelFile(io.BytesIO(content))
             for sheet_name in excel_file.sheet_names:
                 df = pd.read_excel(excel_file, sheet_name=sheet_name)
+                csv_text = df.to_csv(index=False)
                 results.append({
                     "page": sheet_name,
                     "heading": sheet_name,
                     "text": f"[{system} - {doc_type} - Sheet: {sheet_name}]\n"
-                            + df.to_csv(index=False),
+                            + csv_text,
+                    # ชื่อชีตมักเป็นไทย แต่เนื้อตารางอาจเป็นอังกฤษล้วน
+                    # ตรวจจากเนื้อตารางเป็นหลัก เพราะนั่นคือสิ่งที่ผู้ใช้ค้นหา
+                    "lang": detect_lang(csv_text),
                     "images": [],
                 })
 
@@ -583,6 +612,12 @@ async def extract_file(
         del content
         gc.collect()
 
+        # นับจำนวน chunk แต่ละภาษา ไว้เช็คว่าแยกภาษาถูกต้องไหม
+        # ถ้าเห็น th 100% ให้สงสัยว่ามีการส่ง header เข้า detect_lang()
+        lang_summary = {"th": 0, "en": 0}
+        for r in results:
+            lang_summary[r.get("lang", "en")] = lang_summary.get(r.get("lang", "en"), 0) + 1
+
         return {
             "status": "ok",
             "filename": filename,
@@ -590,6 +625,7 @@ async def extract_file(
             "system": system,
             "doc_type": doc_type,
             "total_pages": len(results),
+            "lang_summary": lang_summary,
             "pages": results,
             # รูปทั้งหมดเป็น base64 ให้ n8n เขียนลง C:\n8n\images\ เอง
             # ชื่อไฟล์ตรงกับที่ปรากฏใน [รูปประกอบ: ...] ของแต่ละ chunk
