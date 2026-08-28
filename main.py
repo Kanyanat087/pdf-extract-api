@@ -24,6 +24,26 @@ os.makedirs(IMAGE_DIR, exist_ok=True)
 # ข้ามรูปที่เล็กกว่านี้ (โลโก้ ไอคอน เส้นคั่น) หน่วยเป็น byte
 MIN_IMAGE_SIZE = 15000
 
+# [เพิ่มใน 5.4] เอกสารมีสองแบบ และควรถูกหั่นคนละกฎ
+#
+#   manual = คู่มือการใช้งานทั่วไป ไม่มีโครงสร้างตายตัว
+#            -> ใช้ heading_level() + _is_open() ตามเดิม
+#   faq    = ไฟล์รวมอาการและวิธีแก้ ทุกเรื่องขึ้นต้นด้วย marker เดิมซ้ำ ๆ
+#            -> ตัด section ทุกครั้งที่เจอ marker ไม่ต้องพึ่งขนาดฟอนต์เลย
+#              1 อาการ = 1 chunk เป๊ะ ผลคงที่ทุกครั้ง ไม่ต้อง tune ratio
+#
+# ⚠️ ถ้าคู่มือ FAQ เล่มไหนใช้คำอื่นขึ้นต้น ให้เพิ่มลงลิสต์นี้
+# ตรวจว่าเล่มไหนใช้คำอะไรได้จาก:
+#   SELECT DISTINCT metadata->>'source' FROM n8n_vectors
+#   WHERE text LIKE '%IR/Description%';
+FAQ_BREAK_MARKERS = [
+    "IR/Description",
+    "อาการ:",
+    "ปัญหา:",
+    "Symptom:",
+    "Issue:",
+]
+
 # หัวข้อ = ฟอนต์ใหญ่กว่าเนื้อความปกติกี่เท่า
 HEADING_SIZE_RATIO = 1.15
 
@@ -31,8 +51,17 @@ HEADING_SIZE_RATIO = 1.15
 # ตัด section ใหม่ได้เสมอ ต่ำกว่านี้แต่เป็นตัวหนา = "หัวข้อย่อย"
 # ตัดได้เฉพาะตอนที่เรื่องก่อนหน้าจบแล้ว ดู heading_level()
 #
-# ⚠️ 1.25 เป็นค่าเริ่มต้น ควรตรวจกับคู่มือจริงก่อน ดูวิธีที่ท้ายไฟล์
-STRONG_HEADING_RATIO = 1.25
+# [ปรับใน 5.3.1] 1.25 -> 1.18
+# 1.25 เข้มเกินไป แทบไม่มีหัวข้อไหนผ่านเกณฑ์ strong เลย
+# ผลคือ E payment Manual.pdf เหลือแค่ 17 chunk แต่ละอันครอบ 5-8 หน้า
+# มีหลายเรื่องปนกันจน embedding เบลอ ค้นอะไรก็เจอ chunk เดิม
+# 1.18 ทำให้หัวข้อจริงผ่านเกณฑ์มากขึ้น chunk เล็กลงและตรงเรื่องขึ้น
+#
+# ⚠️ ค่านี้ยังเป็นการประมาณ ถ้าผลยังไม่ดี:
+#   ได้ chunk น้อยเกิน (chunk ใหญ่ ปนหลายเรื่อง) -> ลดเป็น 1.16
+#   ได้ chunk เยอะเกิน (ขั้นตอนขาดกลาง)         -> เพิ่มเป็น 1.20
+# หาค่าที่แม่นได้จากสคริปต์ตรวจฟอนต์ท้ายไฟล์
+STRONG_HEADING_RATIO = 1.18
 
 # [เพิ่มใน 5.3] บรรทัดที่บอกว่า "เรื่องนี้ยังไม่จบ"
 # เมื่อ section ปัจจุบันมีคำเหล่านี้อยู่ หัวข้อย่อยที่โผล่ตามมาจะไม่ตัด section ใหม่
@@ -49,8 +78,12 @@ OPEN_MARKERS = [
 # [เปลี่ยนใน 5.3] 1200 -> 2500
 # พอ 5.3 เลิกตัด section กลางเรื่องแล้ว section จะยาวขึ้นมาก
 # ถ้าคงไว้ที่ 1200 ขั้นตอนชุดเดียวก็จะถูก split_long_section() หั่นกลางคันอยู่ดี
-# กลายเป็นย้ายปัญหาเฉย ๆ ไม่ได้แก้
-MAX_SECTION_CHARS = 2500
+#
+# [ปรับใน 5.3.1] 2500 -> 1500
+# 2500 หลวมเกินไปเมื่อใช้คู่กับ STRONG_HEADING_RATIO ที่เข้ม
+# ทำให้ chunk เดียวกินหลายหน้าและปนหลายเรื่อง
+# 1500 ยังพอใส่ Resolution Steps ชุดหนึ่งได้ครบ แต่ไม่ปล่อยให้ยาวจนเบลอ
+MAX_SECTION_CHARS = 1500
 
 # ถ้า section สั้นกว่านี้ จะถูกรวมกับ section ถัดไป
 # หมายเหตุ: อย่าตั้งสูงเกินไป เพราะเคสที่เนื้อหาสั้นแต่จบในตัวเอง
@@ -65,7 +98,7 @@ SELF_CONTAINED_MARKERS = ["Resolution Steps"]
 app = FastAPI(
     title="Multi-Format Document Extraction API",
     description="สกัดข้อความและรูปจากเอกสาร แบ่ง chunk ตามหัวข้อ สำหรับ Vector DB / RAG",
-    version="5.3.0",
+    version="5.4.0",
 )
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -240,6 +273,18 @@ def _is_open(section):
     return any(m in body or m in head for m in OPEN_MARKERS)
 
 
+def _is_faq_break(text):
+    """
+    [เพิ่มใน 5.4] บรรทัดนี้เป็นจุดเริ่มของ "เรื่องใหม่" ในไฟล์ FAQ หรือไม่
+
+    ใช้เฉพาะกับ doc_type = faq เท่านั้น
+    ไฟล์ FAQ ทุกเรื่องขึ้นต้นด้วย marker เดิมซ้ำ ๆ (เช่น IR/Description:)
+    ซึ่งเชื่อถือได้มากกว่าขนาดฟอนต์ เพราะไม่ขึ้นกับว่าคนทำเอกสาร
+    จะพิมพ์ตัวหนาหรือปรับขนาดฟอนต์ตรงไหนบ้าง
+    """
+    return any(m in text for m in FAQ_BREAK_MARKERS)
+
+
 def is_toc_line(text):
     """
     บรรทัดสารบัญ เช่น  Trip Activity ..................... 5
@@ -318,10 +363,14 @@ def save_page_images(doc, page, page_num):
 # ส่วนที่ 3 : แบ่งเอกสารเป็น section ตามหัวข้อ
 # ===============================================================
 
-def extract_sections(doc):
+def extract_sections(doc, doc_type="manual"):
     """
     เดินทีละหน้า ทีละบรรทัด แล้วรวมเป็น section
     section ใหม่เริ่มเมื่อเจอหัวข้อ และไหลข้ามหน้าได้
+
+    [เปลี่ยนใน 5.4] แยกกฎตัดตาม doc_type
+      faq    -> ตัดทุกครั้งที่เจอ FAQ_BREAK_MARKERS (หรือหัวข้อจริงขนาดใหญ่)
+      manual -> ใช้ heading_level() + _is_open() ตามเดิม
 
     [เปลี่ยนใน 5.3] หัวข้อย่อยจะไม่ตัด section ถ้าเรื่องปัจจุบันยังไม่จบ
     ดู heading_level() และ _is_open()
@@ -332,6 +381,21 @@ def extract_sections(doc):
     body_size = get_body_font_size(doc)
     sections = []
     all_images = []          # เก็บ base64 ของรูปทุกใบ ส่งกลับให้ n8n เขียนลงดิสก์
+
+    # เก็บทุกบรรทัดของทั้งเล่มไว้ก่อน เพื่อเช็คว่าโหมด faq ใช้ได้จริงไหม
+    # ถ้าเล่มนี้ตั้งเป็น faq แต่ไม่มี marker เลยแม้แต่อันเดียว
+    # การใช้โหมด faq จะได้ chunk เดียวทั้งเล่ม ซึ่งแย่กว่าเดิมมาก
+    # จึงถอยกลับไปใช้โหมด manual แทน
+    use_faq_mode = doc_type == "faq"
+    if use_faq_mode:
+        marker_found = False
+        for page in doc:
+            page_text = page.get_text()
+            if _is_faq_break(page_text):
+                marker_found = True
+                break
+        if not marker_found:
+            use_faq_mode = False
 
     current = {
         "heading": None,
@@ -368,12 +432,18 @@ def extract_sections(doc):
         for idx, item in enumerate(page_lines):
             level = heading_level(item["raw"], body_size)
 
-            # หัวข้อจริงตัดได้เสมอ
-            # หัวข้อย่อยตัดได้เฉพาะตอนที่ section ปัจจุบันจบเรื่องแล้ว
-            start_new = (
-                level == "strong"
-                or (level == "weak" and not _is_open(current))
-            )
+            if use_faq_mode:
+                # ไฟล์ FAQ: marker คือจุดเริ่มเรื่องใหม่ที่แน่นอนที่สุด
+                # ยังยอมให้หัวข้อจริงขนาดใหญ่ตัดได้ด้วย เผื่อส่วนหัวเล่ม
+                # ที่อยู่ก่อนอาการแรก (ปก สารบัญ บทนำ) ไม่ถูกลากมารวม
+                start_new = _is_faq_break(item["text"]) or level == "strong"
+            else:
+                # ไฟล์คู่มือ: หัวข้อจริงตัดได้เสมอ
+                # หัวข้อย่อยตัดได้เฉพาะตอนที่ section ปัจจุบันจบเรื่องแล้ว
+                start_new = (
+                    level == "strong"
+                    or (level == "weak" and not _is_open(current))
+                )
 
             if start_new:
                 # ปิด section เดิมก่อนเริ่มอันใหม่
@@ -498,8 +568,9 @@ def split_long_section(section):
     (การใส่หัวข้อนำหน้าทำใน endpoint ตอนประกอบ header)
 
     ⚠️ ตัวนี้ยังหั่นกลางขั้นตอนได้อยู่ ถ้าเนื้อหายาวเกิน MAX_SECTION_CHARS
-    5.3 ขยายเป็น 2500 เพื่อลดโอกาสนั้น แต่ไม่ได้ตัดทิ้งทั้งหมด
-    ถ้ายังเจอเคสที่ขั้นตอนขาดกลาง ให้ขยายค่านั้นอีก
+    ปัจจุบันตั้งไว้ 1500 ซึ่งเป็นการประนีประนอมระหว่าง
+    "chunk ใหญ่จนปนหลายเรื่อง" กับ "chunk เล็กจนขั้นตอนขาดกลาง"
+    ถ้าเจอเคสที่ขั้นตอนขาดกลาง ให้ขยายค่านั้นขึ้น
     """
     body = "\n".join(section["lines"]).strip()
 
@@ -550,7 +621,7 @@ async def extract_file(
         if lower_name.endswith(".pdf"):
             doc = fitz.open(stream=content, filetype="pdf")
 
-            sections, extracted_images = extract_sections(doc)
+            sections, extracted_images = extract_sections(doc, doc_type)
             sections = merge_short_sections(sections)
 
             for sec in sections:
@@ -713,4 +784,5 @@ async def extract_file(
             status_code=500,
             detail=f"เกิดข้อผิดพลาดในการประมวลผลไฟล์: {str(e)}",
         )
+
 
