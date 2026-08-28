@@ -27,8 +27,30 @@ MIN_IMAGE_SIZE = 15000
 # หัวข้อ = ฟอนต์ใหญ่กว่าเนื้อความปกติกี่เท่า
 HEADING_SIZE_RATIO = 1.15
 
+# [เพิ่มใน 5.3] หัวข้อที่ฟอนต์ใหญ่กว่าเนื้อความถึงเท่านี้ = "หัวข้อจริง"
+# ตัด section ใหม่ได้เสมอ ต่ำกว่านี้แต่เป็นตัวหนา = "หัวข้อย่อย"
+# ตัดได้เฉพาะตอนที่เรื่องก่อนหน้าจบแล้ว ดู heading_level()
+#
+# ⚠️ 1.25 เป็นค่าเริ่มต้น ควรตรวจกับคู่มือจริงก่อน ดูวิธีที่ท้ายไฟล์
+STRONG_HEADING_RATIO = 1.25
+
+# [เพิ่มใน 5.3] บรรทัดที่บอกว่า "เรื่องนี้ยังไม่จบ"
+# เมื่อ section ปัจจุบันมีคำเหล่านี้อยู่ หัวข้อย่อยที่โผล่ตามมาจะไม่ตัด section ใหม่
+# เพราะมันคือขั้นตอนของเรื่องเดิม ไม่ใช่เรื่องใหม่
+OPEN_MARKERS = [
+    "Resolution Steps",
+    "IR/Description",
+    "วิธีแก้ไข",
+    "ขั้นตอนการแก้ไข",
+]
+
 # ความยาวสูงสุดต่อ 1 section ถ้าเกินจะถูกซอยย่อย
-MAX_SECTION_CHARS = 1200
+#
+# [เปลี่ยนใน 5.3] 1200 -> 2500
+# พอ 5.3 เลิกตัด section กลางเรื่องแล้ว section จะยาวขึ้นมาก
+# ถ้าคงไว้ที่ 1200 ขั้นตอนชุดเดียวก็จะถูก split_long_section() หั่นกลางคันอยู่ดี
+# กลายเป็นย้ายปัญหาเฉย ๆ ไม่ได้แก้
+MAX_SECTION_CHARS = 2500
 
 # ถ้า section สั้นกว่านี้ จะถูกรวมกับ section ถัดไป
 # หมายเหตุ: อย่าตั้งสูงเกินไป เพราะเคสที่เนื้อหาสั้นแต่จบในตัวเอง
@@ -43,7 +65,7 @@ SELF_CONTAINED_MARKERS = ["Resolution Steps"]
 app = FastAPI(
     title="Multi-Format Document Extraction API",
     description="สกัดข้อความและรูปจากเอกสาร แบ่ง chunk ตามหัวข้อ สำหรับ Vector DB / RAG",
-    version="5.2.0",
+    version="5.3.0",
 )
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -76,6 +98,11 @@ def guess_system_name(filename):
              ถ้าไม่มีขีดล่างก็ใช้ชื่อไฟล์ทั้งอัน ไม่ตกไปเป็น unknown อีก
       ACCA_manual_pdf.pdf  ->  ACCA
       EPayment.pdf         ->  EPayment
+
+    ⚠️ ค่าที่ได้จากที่นี่ไม่ตรงกับค่า system ที่ใช้ค้นหา
+    (เช่นได้ "Exact Synergy Manual" ไม่ใช่ "synergy")
+    ปัจจุบันการแมปชื่อไฟล์ -> system ทำที่ n8n ใน Code in JavaScript3
+    ฟังก์ชันนี้เป็นแค่ค่าสำรองเวลาไม่ได้ส่ง system มาทางฟอร์ม
     """
     stem = os.path.splitext(filename)[0].strip()
     if not stem:
@@ -129,60 +156,88 @@ def get_body_font_size(doc):
     return counter.most_common(1)[0][0]
 
 
-def is_heading(line, body_size):
+def heading_level(line, body_size):
     """
-    ตัดสินว่าบรรทัดนี้เป็นหัวข้อหรือไม่
-    เกณฑ์: ฟอนต์ใหญ่กว่าปกติ หรือ ตัวหนา + สั้น
+    คืนระดับของบรรทัดนี้: "strong" | "weak" | None
+
+    strong = หัวข้อจริง ฟอนต์ใหญ่ชัดเจน ตัด section ใหม่ได้เสมอ
+    weak   = อาจเป็นหัวข้อย่อย (ตัวหนา + สั้น) ตัดได้เฉพาะตอนเรื่องก่อนหน้าจบแล้ว
+    None   = ไม่ใช่หัวข้อ
+
+    [แก้บั๊ก 5.3 — บั๊กใหญ่] ของเดิมชื่อ is_heading() คืน True/False อย่างเดียว
+    ทำให้บรรทัดอย่าง "Step 1: Select the coded items" หรือ "กรณีที่ 1 : ..."
+    ที่พิมพ์ตัวหนา ถูกตัดเป็น section ใหม่ทุกอัน
+    ผลคือคำถามอยู่ chunk หนึ่ง คำตอบอยู่อีก chunk หนึ่ง
+    LLM ได้แต่หัวเรื่องกับคำว่า "Resolution Steps:" ไปโดยไม่มีขั้นตอน
+    แล้วแต่งขั้นตอนขึ้นมาเอง
+
+    พบใน 7 ไฟล์: E payment Manual / e- Receipt / Mannual Newstaff / ACCA /
+    EG_Finance_422_ver1 / EG_System_422_ver1 / Manual Power BI for Sale
 
     [แก้บั๊ก 4.2] เอากฎ "ขึ้นต้นด้วยเลขข้อ" ออก
     กฎเดิมทำให้ขั้นตอน 1. 2. 3. 4. ในเนื้อหา ถูกมองเป็นหัวข้อใหม่ทุกข้อ
-    ผลคือขั้นตอนแก้ปัญหาชุดเดียวถูกหั่นเป็น chunk ละข้อ
-    คำถามอยู่ chunk หนึ่ง คำตอบอยู่อีก chunk หนึ่ง
 
     [แก้บั๊ก 4.3] กรองเลขลอย ๆ และเลขโรมันออก
     พบใน EPayment.pdf ว่า 153 จาก 195 chunk (78%) มี heading เป็น
     ตัวเลขล้วนหรือเลขโรมันล้วน เช่น "3" "2" "II." "III."
-    เพราะเลขข้อหรือเลขหน้าที่พิมพ์ตัวหนา เข้าเงื่อนไข is_bold + สั้น
-    ทำให้ chunk ถูกหั่นทุกครั้งที่เจอเลข และ heading ไม่ให้บริบทกับ LLM เลย
     """
     spans = line.get("spans", [])
     if not spans:
-        return False
+        return None
 
     text = "".join(s.get("text", "") for s in spans).strip()
     if not text or len(text) > 120:      # หัวข้อมักไม่ยาวมาก
-        return False
+        return None
 
     # --- กรองสิ่งที่ไม่มีทางเป็นหัวข้อ ---
 
     # ต้องมีตัวอักษรอย่างน้อย 1 ตัว (ไทยหรืออังกฤษ)
     # กรอง "3" "2." "1)" "-" "•" ที่เป็นเลขข้อหรือ bullet
     if not re.search(r"[A-Za-zก-๙]", text):
-        return False
+        return None
 
     # เลขโรมันล้วน เช่น "II." "III." "IV)" "i."
     # มีตัวอักษรจึงรอดกฎข้างบนมาได้ แต่ไม่ใช่หัวข้อ
     if re.fullmatch(r"[IVXLCDMivxlcdm]+[\.\)]?", text):
-        return False
+        return None
 
     # สั้นเกินกว่าจะเป็นหัวข้อที่มีความหมาย
     if len(text) < 3:
-        return False
+        return None
 
-    # --- เกณฑ์ตัดสินว่าเป็นหัวข้อ ---
+    # --- ตัดสินระดับ ---
 
     max_size = max(s.get("size", 0) for s in spans)
     # flags bit 4 (ค่า 16) = ตัวหนา
     is_bold = any(s.get("flags", 0) & 16 for s in spans)
 
+    if max_size >= body_size * STRONG_HEADING_RATIO:
+        return "strong"
+
     if max_size >= body_size * HEADING_SIZE_RATIO:
-        return True
+        return "weak"
 
-    # ตัวหนา + สั้น = น่าจะเป็นหัวข้อ
+    # ตัวหนา + สั้น = น่าจะเป็นหัวข้อ แต่ไม่แน่ใจว่าระดับไหน
     if is_bold and len(text) < 80:
-        return True
+        return "weak"
 
-    return False
+    return None
+
+
+def _is_open(section):
+    """
+    [เพิ่มใน 5.3] section นี้ยัง "ค้างอยู่" ไหม
+    คือเปิดเรื่องไว้แล้ว (มี Resolution Steps / IR/Description) แต่ยังไม่จบ
+
+    ถ้าใช่ หัวข้อย่อยที่ตามมาถือเป็นขั้นตอนของเรื่องนี้ ไม่ใช่เรื่องใหม่
+    จึงห้ามตัด section
+
+    ข้อดีของวิธีนี้เทียบกับการไล่บล็อกทีละ pattern (Step / Case / กรณีที่ / แบบที่)
+    คือไม่ต้องรู้ล่วงหน้าว่าคู่มือเล่มถัดไปจะใช้คำว่าอะไร
+    """
+    body = "\n".join(section["lines"])
+    head = section["heading"] or ""
+    return any(m in body or m in head for m in OPEN_MARKERS)
 
 
 def is_toc_line(text):
@@ -268,6 +323,9 @@ def extract_sections(doc):
     เดินทีละหน้า ทีละบรรทัด แล้วรวมเป็น section
     section ใหม่เริ่มเมื่อเจอหัวข้อ และไหลข้ามหน้าได้
 
+    [เปลี่ยนใน 5.3] หัวข้อย่อยจะไม่ตัด section ถ้าเรื่องปัจจุบันยังไม่จบ
+    ดู heading_level() และ _is_open()
+
     หมายเหตุ: page_lines.sort(key=lambda x: x["y"]) ถูกต้องแล้ว
     PyMuPDF นับ y จากบนลงล่าง เรียงน้อยไปมาก = บนลงล่าง ห้ามกลับทิศ
     """
@@ -308,7 +366,16 @@ def extract_sections(doc):
         page_lines.sort(key=lambda x: x["y"])
 
         for idx, item in enumerate(page_lines):
-            if is_heading(item["raw"], body_size):
+            level = heading_level(item["raw"], body_size)
+
+            # หัวข้อจริงตัดได้เสมอ
+            # หัวข้อย่อยตัดได้เฉพาะตอนที่ section ปัจจุบันจบเรื่องแล้ว
+            start_new = (
+                level == "strong"
+                or (level == "weak" and not _is_open(current))
+            )
+
+            if start_new:
                 # ปิด section เดิมก่อนเริ่มอันใหม่
                 if current["lines"] or current["heading"]:
                     sections.append(current)
@@ -321,6 +388,7 @@ def extract_sections(doc):
                     "images": [],
                 }
             else:
+                # หัวข้อย่อยที่ไม่ได้ตัด ให้เก็บเป็นบรรทัดเนื้อหา ห้ามทิ้ง
                 current["lines"].append(item["text"])
                 current["page_end"] = page_num
 
@@ -428,6 +496,10 @@ def split_long_section(section):
     section ที่ยาวเกินไป ให้ซอยเป็นชิ้นย่อย
     แต่ยังคงใส่หัวข้อเดิมนำหน้าทุกชิ้น เพื่อไม่ให้หลุดบริบท
     (การใส่หัวข้อนำหน้าทำใน endpoint ตอนประกอบ header)
+
+    ⚠️ ตัวนี้ยังหั่นกลางขั้นตอนได้อยู่ ถ้าเนื้อหายาวเกิน MAX_SECTION_CHARS
+    5.3 ขยายเป็น 2500 เพื่อลดโอกาสนั้น แต่ไม่ได้ตัดทิ้งทั้งหมด
+    ถ้ายังเจอเคสที่ขั้นตอนขาดกลาง ให้ขยายค่านั้นอีก
     """
     body = "\n".join(section["lines"]).strip()
 
@@ -641,3 +713,4 @@ async def extract_file(
             status_code=500,
             detail=f"เกิดข้อผิดพลาดในการประมวลผลไฟล์: {str(e)}",
         )
+
